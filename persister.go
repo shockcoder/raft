@@ -2,6 +2,7 @@ package raft
 
 import "sync"
 
+// 日志快照
 type Persister struct {
 	mu        sync.Mutex
 	raftstate []byte

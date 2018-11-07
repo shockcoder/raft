@@ -67,6 +67,38 @@ type Raft struct {
 	matchIndex []int // 对于每一个服务器, 已经复制给他的日志最高索引值
 }
 
+func (rf *Raft) getLastIndex() int {
+	return rf.log[len(rf.log)-1].LogIndex
+}
+
+// 发送日志条目所需要的参数
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogTerm  int
+	PrevLogIndex int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term      int
+	Success   bool
+	NextIndex int
+}
+
+// 保存raft的持久状态到 稳定的存储器
+// 以便崩溃后重启
+func (rf *Raft) persist() {
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+}
+
 func (rf *Raft) readPersist(data []byte) {
 	// 对快照进行操作代码
 	// 例如：
@@ -126,6 +158,125 @@ func (rf *Raft) Kill() {
 	//如果需要杀死raft节点
 }
 
+type InstallSnapshotArgs struct {
+	Term             int
+	LeaderId         int
+	LastIncludeIndex int
+	LastIncludeTerm  int
+	Data             []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	if ok {
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.state = STATE_FOLLOWER
+			rf.votedFor = -1
+			return ok
+		}
+
+		rf.nextIndex[server] = args.LastIncludeIndex + 1
+		rf.matchIndex[server] = args.LastIncludeIndex
+	}
+
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if ok {
+		if rf.state != STATE_LEADER {
+			return ok
+		}
+		if args.Term != rf.currentTerm {
+			return ok
+		}
+
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.state = STATE_FOLLOWER
+			rf.votedFor = -1
+			rf.persist()
+			return ok
+		}
+		if reply.Success {
+			if len(args.Entries) > 0 {
+				rf.nextIndex[server] = args.Entries[len(args.Entries)-1].LogIndex - 1
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+			}
+		} else {
+			rf.nextIndex[server] = reply.NextIndex
+		}
+	}
+	return ok
+}
+
+func (rf *Raft) boatcastAppendEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	N := rf.commitIndex
+	last := rf.getLastIndex()
+	baseIndex := rf.log[0].LogIndex
+	for i := rf.commitIndex; i <= last; i++ {
+		num := 1
+		for j := range rf.peers {
+			if j != rf.me && rf.matchIndex[j] >= i && rf.log[i-baseIndex].LogTerm == rf.currentTerm {
+				num++
+			}
+		}
+		if 2*num > len(rf.peers) {
+			N = i
+		}
+	}
+	if N != rf.commitIndex {
+		rf.commitIndex = N
+		rf.chanCommit <- true
+	}
+
+	for i := range rf.peers {
+		if i != rf.me && rf.state == STATE_LEADER {
+
+			//copy(args.Entries, rf.log[args.PrevLogIndex + 1 :])
+
+			if rf.nextIndex[i] > baseIndex {
+				var args AppendEntriesArgs
+				args.Term = rf.currentTerm
+				args.LeaderId = rf.me
+				args.PrevLogIndex = rf.nextIndex[i] - 1
+				// fmt.Printf("baseIndex: %d PrevLogIndex: %d\n", baseIndex, args.PrevLogIndex)
+				args.PrevLogTerm = rf.log[args.PrevLogIndex+1-baseIndex].LogTerm
+				//args.Entries = make([]LogEntry, len(rf.log[args.PrevLogIndex+1:]))
+				args.Entries = make([]LogEntry, len(rf.log[args.PrevLogIndex+1-baseIndex:]))
+				copy(args.Entries, rf.log[args.PrevLogIndex+1-baseIndex:])
+				args.LeaderCommit = rf.commitIndex
+				go func(i int, args AppendEntriesArgs) {
+					var reply AppendEntriesReply
+					rf.sendAppendEntries(i, args, &reply)
+				}(i, args)
+			} else {
+				var args InstallSnapshotArgs
+				args.Term = rf.currentTerm
+				args.LeaderId = rf.me
+				args.LastIncludeIndex = rf.log[0].LogIndex
+				args.LastIncludeTerm = rf.log[0].LogTerm
+				args.Data = rf.persister.snapshot
+				go func(server int, args InstallSnapshotArgs) {
+					reply := &InstallSnapshotArgs{}
+					rf.sendInstallSnapshot(server, args, reply)
+				}(i, args)
+			}
+		}
+	}
+
+}
+
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -162,7 +313,50 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				//fmt.Printf("Leader:%v %v\n",rf.me,"boatcastAppendEntries	")
 				rf.boatcastAppendEntries()
 				time.Sleep(HBINTERVAL)
+			case STATE_CANDIDATE:
+				rf.mu.Lock()
+				rf.currentTerm++
+				rf.votedFor = rf.me
+				rf.voteCount = 1
+				rf.persist()
+				rf.mu.Unlock()
+				go rf.boatcastAppendEntries()
+				select {
+				case <-time.After(time.Duration(rand.Int63()%333+550) * time.Millisecond):
+				case <-rf.chanHeartbeat:
+					rf.state = STATE_FOLLOWER
+				case <-rf.chanLeader:
+					rf.mu.Lock()
+					rf.state = STATE_LEADER
+					rf.nextIndex = make([]int, len(rf.peers))
+					rf.matchIndex = make([]int, len(rf.peers))
+					for i := range rf.peers {
+						rf.nextIndex[i] = rf.getLastIndex() + 1
+						rf.matchIndex[i] = 0
+					}
+					rf.mu.Unlock()
+				}
+			}
+
+		}
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-rf.chanCommit:
+				rf.mu.Lock()
+				commitIndex := rf.commitIndex
+				baseIndex := rf.log[0].LogIndex
+				for i := rf.lastApplied + 1; i <= commitIndex; i++ {
+					msg := ApplyMsg{Index: i, Command: rf.log[i-baseIndex].LogComd}
+					applyCh <- msg
+					rf.lastApplied = i
+				}
+				rf.mu.Unlock()
 			}
 		}
 	}()
+
+	return rf
 }

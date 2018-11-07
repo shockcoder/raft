@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
+	"math/rand"
 	"project_01/rpc-realize"
 	"sync"
 	"time"
@@ -77,6 +78,49 @@ func (rf *Raft) readPersist(data []byte) {
 
 }
 
+func (rf *Raft) readSnapshot(data []byte) {
+	rf.readPersist(rf.persister.ReadRaftState())
+
+	if len(data) == 0 {
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+
+	var LastIncludedIndex int
+	var LastIncludedTerm int
+
+	d.Decode(&LastIncludedIndex)
+	d.Decode(&LastIncludedTerm)
+
+	rf.commitIndex = LastIncludedIndex
+	rf.lastApplied = LastIncludedIndex
+
+	rf.log = truncateLog(LastIncludedIndex, LastIncludedTerm, rf.log)
+
+	msg := ApplyMsg{UseSnapshot: true, Snapshot: data}
+
+	go func() {
+		rf.chanApply <- msg
+	}()
+
+}
+
+func truncateLog(lastIncludeIndex int, lastIncludedTerm int, log []LogEntry) []LogEntry {
+	var newLogEntries []LogEntry
+	newLogEntries = append(newLogEntries, LogEntry{LogIndex: lastIncludeIndex, LogTerm: lastIncludedTerm})
+
+	for index := len(log) - 1; index >= 0; index-- {
+		if log[index].LogIndex == lastIncludeIndex && log[index].LogTerm == lastIncludedTerm {
+			newLogEntries = append(newLogEntries, log[index+1:]...)
+			break
+		}
+	}
+
+	return newLogEntries
+}
+
 // 当一个raft节点不在需要的时候， 调用Kill()
 func (rf *Raft) Kill() {
 	//如果需要杀死raft节点
@@ -103,4 +147,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 崩溃之前从 从快照中初始化
 	rf.readPersist(persister.ReadRaftState())
 	rf.readSnapshot(persister.ReadSnapshot())
+
+	go func() {
+		for {
+			switch rf.state {
+			case STATE_FOLLOWER:
+				select {
+				case <-rf.chanHeartbeat:
+				case <-rf.chanGrantVote:
+				case <-time.After(time.Duration(rand.Int63()%333+550) * time.Millisecond):
+					rf.state = STATE_CANDIDATE
+				}
+			case STATE_LEADER:
+				//fmt.Printf("Leader:%v %v\n",rf.me,"boatcastAppendEntries	")
+				rf.boatcastAppendEntries()
+				time.Sleep(HBINTERVAL)
+			}
+		}
+	}()
 }
